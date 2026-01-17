@@ -17,6 +17,7 @@ import time
 import requests
 import ssl
 import urllib3
+import math
 from typing import Dict, Optional
 
 # Suppress SSL warnings for self-signed certificates
@@ -52,10 +53,17 @@ class TradingBot:
         self.current_step = 0   # Current simulation step
         self.orders_sent = 0    # Number of orders sent
         
+        self.open_orders = []
+
         # Market data
         self.last_bid = 0.0
         self.last_ask = 0.0
         self.last_mid = 0.0
+
+        # Lightweight stats for adaptive quoting
+        self.price_history = []      # Rolling mid prices
+        self.ewma_var = 0.0          # EWMA variance estimate
+        self.ewma_lambda = 0.94      # Decay for volatility
         
         # WebSocket connections
         self.market_ws = None
@@ -75,36 +83,52 @@ class TradingBot:
     def register(self) -> bool:
         """Register with the server and get an auth token."""
         print(f"[{self.student_id}] Registering for scenario '{self.scenario}'...")
-        try:
-            url = f"{self.http_proto}://{self.host}/api/replays/{self.scenario}/start"
-            headers = {"Authorization": f"Bearer {self.student_id}"}
-            if self.password:
-                headers["X-Team-Password"] = self.password
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=10,
-                verify=not self.secure  # Disable SSL verification for self-signed certs
-            )
-            
-            if resp.status_code != 200:
-                print(f"[{self.student_id}] Registration FAILED: {resp.text}")
-                return False
-            
-            data = resp.json()
-            self.token = data.get("token")
-            self.run_id = data.get("run_id")
-            
-            if not self.token or not self.run_id:
-                print(f"[{self.student_id}] Missing token or run_id")
-                return False
-            
-            print(f"[{self.student_id}] Registered! Run ID: {self.run_id}")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.student_id}] Registration error: {e}")
-            return False
+
+        url = f"{self.http_proto}://{self.host}/api/replays/{self.scenario}/start"
+        headers = {"Authorization": f"Bearer {self.student_id}", "Connection": "close"}
+        if self.password:
+            headers["X-Team-Password"] = self.password
+
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=5,
+                    verify=not self.secure  # Disable SSL verification for self-signed certs
+                )
+
+                if resp.status_code != 200:
+                    print(f"[{self.student_id}] Registration FAILED (attempt {attempt}): {resp.text}")
+                    time.sleep(attempt)
+                    continue
+
+                data = resp.json()
+                self.token = data.get("token")
+                self.run_id = data.get("run_id")
+
+                if not self.token or not self.run_id:
+                    print(f"[{self.student_id}] Missing token or run_id (attempt {attempt})")
+                    time.sleep(attempt)
+                    continue
+
+                print(f"[{self.student_id}] Registered! Run ID: {self.run_id}")
+                return True
+
+            except requests.exceptions.SSLError as e:
+                print(f"[{self.student_id}] TLS error (attempt {attempt}): {e}")
+                if self.secure:
+                    print(f"[{self.student_id}] Hint: retry without --secure if the server expects plain HTTP.")
+                time.sleep(attempt)
+            except requests.exceptions.ConnectionError as e:
+                print(f"[{self.student_id}] Connection error (attempt {attempt}): {e}")
+                time.sleep(attempt)
+            except Exception as e:
+                print(f"[{self.student_id}] Registration exception (attempt {attempt}): {e}")
+                time.sleep(attempt)
+
+        print(f"[{self.student_id}] Registration failed after retries.")
+        return False
     
     # =========================================================================
     # CONNECTION - Connect to WebSocket streams
@@ -174,6 +198,9 @@ class TradingBot:
                 step_latency = (recv_time - self.last_done_time) * 1000  # ms
                 self.step_latencies.append(step_latency)
             
+            self.bids = data.get("bids", []) 
+            self.asks = data.get("asks", [])
+
             # Extract market data
             self.current_step = data.get("step", 0)
             self.last_bid = data.get("bid", 0.0)
@@ -232,37 +259,85 @@ class TradingBot:
         ║    - Or return None to not send an order                          ║
         ╚══════════════════════════════════════════════════════════════════╝
         """
-        
-        # Skip if no valid prices
+        # Short-circuit if feed is bad
         if mid <= 0 or bid <= 0 or ask <= 0:
             return None
-        
-        # =================================================================
-        # EXAMPLE STRATEGY: Conservative trading
-        # 
-        # - Cross the spread aggressively to get fills
-        # - Manage inventory by alternating buy/sell
-        # =================================================================
-        
-        # Only trade every 50 steps to avoid hitting order limits
-        if self.current_step % 50 != 0:
+
+        # Maintain rolling mid prices for volatility sizing
+        self.price_history.append(mid)
+        if len(self.price_history) > 400:
+            self.price_history.pop(0)
+
+        if len(self.price_history) >= 2:
+            ret = math.log(mid / self.price_history[-2]) if self.price_history[-2] > 0 else 0.0
+            if self.ewma_var == 0.0:
+                self.ewma_var = ret * ret
+            else:
+                self.ewma_var = self.ewma_lambda * self.ewma_var + (1 - self.ewma_lambda) * (ret * ret)
+        sigma = math.sqrt(self.ewma_var) if self.ewma_var > 0 else 0.01
+
+        # --- 1. Crash / imbalance guard ---
+        total_bid_vol = sum(b.get("qty", 0) for b in getattr(self, "bids", []))
+        total_ask_vol = sum(a.get("qty", 0) for a in getattr(self, "asks", []))
+        obi = 0.0
+        if (total_bid_vol + total_ask_vol) > 0:
+            obi = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
+
+        if obi < -0.8 and self.inventory > 0:
+            dump_qty = max(0, int(self.inventory // 100) * 100)
+            if dump_qty >= 100:
+                print(f"[{self.student_id}] Crash guard: OBI={obi:.2f}, dumping {dump_qty}")
+                return {"side": "SELL", "price": bid, "qty": min(dump_qty, 500)}
+
+        if obi > 0.8 and self.inventory < 0:
+            cover_qty = max(0, int((-self.inventory) // 100) * 100)
+            if cover_qty >= 100:
+                print(f"[{self.student_id}] Bid vacuum: OBI={obi:.2f}, covering {cover_qty}")
+                return {"side": "BUY", "price": ask, "qty": min(cover_qty, 500)}
+
+        # --- 2. Order limit protection ---
+        if len(self.open_orders) >= 40:
+            oldest_order_id = self.open_orders.pop(0)
+            cancel_msg = {"type": "CANCEL_ORDER", "order_id": oldest_order_id}
+            if self.order_ws and self.order_ws.sock:
+                self.order_ws.send(json.dumps(cancel_msg))
             return None
-        
-        # If we're too long, sell aggressively (hit the bid)
-        if self.inventory > 200:
-            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
-        
-        # If we're too short, buy aggressively (lift the offer)
-        elif self.inventory < -200:
-            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
-        
-        # Otherwise, alternate buy/sell to demonstrate trading
-        elif (self.current_step // 50) % 2 == 0:
-            # Buy aggressively (cross the spread)
-            return {"side": "BUY", "price": round(ask, 2), "qty": 100}
-        else:
-            # Sell aggressively (cross the spread)
-            return {"side": "SELL", "price": round(bid, 2), "qty": 100}
+
+        # --- 3. Inventory-aware market making (Avellaneda-Stoikov lite) ---
+        gamma = 0.35                      # Inventory risk aversion
+        k = 1.5                           # Liquidity parameter proxy
+        horizon = 0.8                     # Pseudo time horizon (seconds)
+        min_tick = 0.01
+
+        inventory_risk = self.inventory * gamma * (sigma ** 2) * horizon
+        reservation_price = mid - inventory_risk
+        spread = max(min_tick * 2, (2.0 / gamma) * math.log(1.0 + (gamma / max(k, 1e-6))))
+
+        # Widen spread if book is thin or volatile
+        depth_penalty = max(0.0, 0.5 - abs(obi))
+        spread *= (1.0 + min(2.0, 5.0 * sigma + depth_penalty))
+
+        half_spread = max(min_tick, spread / 2.0)
+        my_bid = round(reservation_price - half_spread, 2)
+        my_ask = round(reservation_price + half_spread, 2)
+
+        # --- 4. Inventory caps and directional bias ---
+        max_inventory = 4800
+        if self.inventory >= max_inventory:
+            return {"side": "SELL", "price": bid, "qty": 100}
+        if self.inventory <= -max_inventory:
+            return {"side": "BUY", "price": ask, "qty": 100}
+
+        # Bias quoting based on current inventory
+        if self.inventory > 300:
+            return {"side": "SELL", "price": my_ask, "qty": 100}
+        if self.inventory < -300:
+            return {"side": "BUY", "price": my_bid, "qty": 100}
+
+        # Neutral: alternate sides to stay active and earn spread
+        if self.current_step % 2 == 0:
+            return {"side": "BUY", "price": my_bid, "qty": 100}
+        return {"side": "SELL", "price": my_ask, "qty": 100}
     
     # =========================================================================
     # ORDER HANDLING
@@ -273,6 +348,7 @@ class TradingBot:
         order_id = f"ORD_{self.student_id}_{self.current_step}_{self.orders_sent}"
         
         msg = {
+            "type": "NEW_ORDER",
             "order_id": order_id,
             "side": order["side"],
             "price": order["price"],
@@ -283,6 +359,9 @@ class TradingBot:
             self.order_send_times[order_id] = time.time()  # Track send time
             self.order_ws.send(json.dumps(msg))
             self.orders_sent += 1
+
+            self.open_orders.append(order_id)
+
         except Exception as e:
             print(f"[{self.student_id}] Send order error: {e}")
     
@@ -309,28 +388,30 @@ class TradingBot:
                 price = data.get("price", 0)
                 side = data.get("side", "")
                 order_id = data.get("order_id", "")
+
+                if order_id in self.open_orders:
+                    self.open_orders.remove(order_id)
                 
-                # Measure fill latency
+                # Metric tracking
                 if order_id in self.order_send_times:
-                    fill_latency = (recv_time - self.order_send_times[order_id]) * 1000  # ms
+                    fill_latency = (recv_time - self.order_send_times[order_id]) * 1000
                     self.fill_latencies.append(fill_latency)
                     del self.order_send_times[order_id]
                 
-                # Update inventory and cash flow
                 if side == "BUY":
                     self.inventory += qty
-                    self.cash_flow -= qty * price  # Spent cash to buy
+                    self.cash_flow -= qty * price
                 else:
                     self.inventory -= qty
-                    self.cash_flow += qty * price  # Received cash from selling
+                    self.cash_flow += qty * price
                 
-                # Calculate mark-to-market PnL using mid price
                 self.pnl = self.cash_flow + self.inventory * self.last_mid
-                
-                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inventory: {self.inventory} | PnL: {self.pnl:.2f}")
+                print(f"[{self.student_id}] FILL: {side} {qty} @ {price:.2f} | Inv: {self.inventory} | PnL: {self.pnl:.2f}")
             
             elif msg_type == "ERROR":
                 print(f"[{self.student_id}] ERROR: {data.get('message')}")
+                # We can't easily remove the specific order ID because the error message 
+                # might not have it, but at least we see the log.
                 
         except Exception as e:
             print(f"[{self.student_id}] Order response error: {e}")
